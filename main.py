@@ -4,6 +4,11 @@ from typing import List, Optional, Dict
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from keybert import KeyBERT
 from transformers import pipeline
+import requests
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(title="Mental Well-being API", version="2.0")
 
@@ -15,6 +20,7 @@ emotion_analyzer = pipeline(
     model="j-hartmann/emotion-english-distilroberta-base",
     return_all_scores=True
 )
+GEMINI_API_KEY =os.getenv("GEMINI_API")
 
 class MoodEntry(BaseModel):
     date: str
@@ -27,7 +33,33 @@ class MoodEntry(BaseModel):
 class MoodLogRequest(BaseModel):
     logs: List[MoodEntry]
 
-# --- Mood API ---
+class SleepEntry(BaseModel):
+    date: str
+    sleep_hours: float
+    
+class ExerciseEntry(BaseModel):
+    date: str
+    activity_type: str          # Running, Strength, Yoga, Walking
+    duration_minutes: int
+    quick_note: str             # 20-word note about how user felt
+
+
+
+def generate_llm_comment(prompt: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    headers = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    response = requests.post(url, headers=headers, json=data)
+    result = response.json()
+
+    try:
+        comment = result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        comment = "Unable to generate comment at the moment."
+    
+    return comment
+
 @app.post("/analyze_mood")
 def analyze_mood(request: MoodLogRequest):
     logs = [log for log in request.logs if log.mood_score is not None and log.mood_label is not None]
@@ -142,3 +174,35 @@ def generate_insights(request: MoodLogRequest):
     return {
         "insights": insights
     }
+
+
+@app.post("/generate_sleep_comment")
+def generate_sleep_comment(entry: SleepEntry):
+    prompt = f"""
+    You are an empathetic wellness assistant. Provide a short (1-2 sentences) comment based ONLY on today's sleep hours.
+    - Sleep <6 hours → express concern and suggest more rest.
+    - Sleep 6-8 hours → appreciation/encouragement.
+    - Sleep >8 hours → praise balance.
+    Tone: empathetic, concise, supportive.
+
+    User's sleep hours: {entry.sleep_hours}
+    """
+    comment = generate_llm_comment(prompt)
+    return {"sleep_comment": comment}
+
+
+@app.post("/generate_exercise_comment")
+def generate_exercise_comment(entry: ExerciseEntry):
+    prompt = f"""
+    You are an empathetic wellness assistant. Based on today's exercise entry, provide a short (1-2 sentences) supportive comment.
+    - Activity type: {entry.activity_type}
+    - Duration: {entry.duration_minutes} minutes
+    - User's note: "{entry.quick_note}"
+
+    Guidelines:
+    - Appreciate effort and consistency.
+    - Encourage and motivate if duration is low or note indicates fatigue.
+    - Use empathy and positive reinforcement.
+    """
+    comment = generate_llm_comment(prompt)
+    return {"exercise_comment": comment}
