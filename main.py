@@ -262,25 +262,25 @@ def analyze_journal(request: MoodLogRequest):
     top_emotions = get_top_emotions(joined_text)
     sentiment_distribution = get_sentiment_distribution(all_texts)
     topics = extract_meaningful_topics(joined_text, max_topics=7)
-    prompt = f"""
-You are a supportive mental health assistant. 💜  
-Here is a journal entry summary:  
-- Emotions: {top_emotions}  
-- Sentiment: {sentiment_distribution}  
-- Topics: {topics}  
+#     prompt = f"""
+#    You are a supportive mental health assistant. 💜  
+#    Here is a journal entry summary:  
+#    - Emotions: {top_emotions}  
+#    - Sentiment: {sentiment_distribution}  
+#    - Topics: {topics}  
 
-Write a short (1–2 sentence) empathetic and encouraging note.  
-✨ Keep it warm, validating, and human-like.  
-🌱 Use 2–3 emojis to add care and positivity.  
-❌ Do NOT give medical, therapeutic, or diagnostic advice.  
-✅ Focus only on appreciation, gentle encouragement, or validation.  
-"""
+#     Write a short (1–2 sentence) empathetic and encouraging note.  
+#    ✨ Keep it warm, validating, and human-like.  
+#    🌱 Use 2–3 emojis to add care and positivity.  
+#    ❌ Do NOT give medical, therapeutic, or diagnostic advice.  
+#    ✅ Focus only on appreciation, gentle encouragement, or validation.  
+#   """
 
-    ai_comment = generate_llm_comment(prompt)
+    # ai_comment = generate_llm_comment(prompt)
 
     return {
         "sentiment_distribution": sentiment_distribution,
         "emotions": top_emotions,
         "topics": topics,
-        "ai_comment": ai_comment
+        # "ai_comment": ai_comment
     }
