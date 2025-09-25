@@ -7,19 +7,42 @@ from transformers import pipeline
 import requests
 import os
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware # Import the CORS middleware
+import nltk
+from nltk.tokenize import sent_tokenize
+import re
+from collections import defaultdict
 
 load_dotenv()
 
-app = FastAPI(title="Mental Well-being API", version="2.0")
+app = FastAPI(title="Mental Well-being API", version="2.0")  
+
+# --- CORS Configuration (CRUCIAL FIX) ---
+# This tells your backend to accept requests from your frontend
+origins = [
+    "http://localhost:5173", 
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods (POST, GET, etc.)
+    allow_headers=["*"], # Allows all headers
+)
+
+# --- The rest of your Python code remains the same ---
+
 
 # Models
 sentiment_analyzer = SentimentIntensityAnalyzer()
-kw_model = KeyBERT()
 emotion_analyzer = pipeline(
     "text-classification",
     model="j-hartmann/emotion-english-distilroberta-base",
     return_all_scores=True
 )
+kw_model = KeyBERT("all-MiniLM-L6-v2")
+
 GEMINI_API_KEY =os.getenv("GEMINI_API")
 
 class MoodEntry(BaseModel):
@@ -27,9 +50,7 @@ class MoodEntry(BaseModel):
     mood_score: Optional[int] = None
     mood_label: Optional[str] = None
     journal_text: Optional[str] = None
-    sleep_hours: Optional[float] = None
-    exercise_done: Optional[bool] = None
-
+    
 class MoodLogRequest(BaseModel):
     logs: List[MoodEntry]
 
@@ -39,11 +60,127 @@ class SleepEntry(BaseModel):
     
 class ExerciseEntry(BaseModel):
     date: str
-    activity_type: str          # Running, Strength, Yoga, Walking
+    activity_type: str          
     duration_minutes: int
-    quick_note: str             # 20-word note about how user felt
+    quick_note: str            
 
 
+# Helper Fucntions
+def extract_meaningful_topics(text: str, max_topics: int = 7):
+    """
+    Extract meaningful, complete topics that are LLM-friendly for aggregation
+    Focus on complete thoughts and emotional contexts
+    """
+    sentences = sent_tokenize(text)
+    meaningful_topics = []
+    important_patterns = [
+        r'i feel\s+\w+',  # "I feel happy/sad/etc"
+        r'i felt\s+\w+',  # "I felt frustrated/proud/etc"
+        r'made me\s+\w+', # "made me happy/angry/etc"
+        r'i was\s+\w+',   # "I was stressed/excited/etc"
+        r'i had\s+\w+',   # "I had difficulty/success/etc"
+        r'i received\s+\w+', # "I received good news/etc"
+        r'i managed\s+to\s+\w+', # "I managed to accomplish/etc"
+        r'helped me\s+\w+',  # "helped me stay calm/etc"
+        r'which brought\s+\w+', # "which brought joy/etc"
+        r'i am grateful\s+for\s+\w+', # gratitude expressions
+    ]
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence.split()) < 4: 
+            continue
+            
+        sentence_lower = sentence.lower()
+        for pattern in important_patterns:
+            if re.search(pattern, sentence_lower):
+                # Extract the complete thought around the pattern
+                clean_sentence = re.sub(r'^(today|yesterday|later|then|also|despite that)\s*,?\s*', '', sentence, flags=re.IGNORECASE)
+                clean_sentence = clean_sentence.strip(' .,!?')
+                if len(clean_sentence.split()) >= 4:
+                    meaningful_topics.append(clean_sentence)
+                break
+        
+        key_indicators = [
+            'stressful', 'frustrated', 'overwhelmed', 'anxious', 'worried', 'sad', 'angry',
+            'happy', 'joy', 'excited', 'proud', 'satisfied', 'content', 'grateful', 'accomplished',
+            'workout', 'exercise', 'work', 'meeting', 'project', 'friend', 'family', 'sleep',
+            'progress', 'achievement', 'success', 'difficulty', 'challenge', 'good news', 'bad news'
+        ]
+        
+        if any(indicator in sentence_lower for indicator in key_indicators):
+            if len(sentence.split()) >= 6 and len(sentence.split()) <= 15:  # Good length for topics
+                clean_sentence = re.sub(r'^(today|yesterday|later|then|also|despite that)\s*,?\s*', '', sentence, flags=re.IGNORECASE)
+                clean_sentence = clean_sentence.strip(' .,!?')
+                if len(clean_sentence.split()) >= 4:
+                    meaningful_topics.append(clean_sentence)
+    
+    unique_topics = []
+    for topic in meaningful_topics:
+        is_duplicate = False
+        topic_words = set(topic.lower().split())
+        
+        for existing in unique_topics:
+            existing_words = set(existing.lower().split())
+            overlap = len(topic_words & existing_words) / len(topic_words.union(existing_words))
+            if overlap >= 0.6:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate and len(topic) > 10:  # Minimum meaningful length
+            unique_topics.append(topic)
+    
+    return unique_topics[:max_topics]
+
+def get_top_emotions(text: str):
+    """
+    Get top 4 emotions with intensity for bar charts - always returns 4 emotions
+    """
+    emotion_scores = emotion_analyzer(text)[0]
+    
+    emotion_mapping = {
+        'joy': 'Joy',
+        'sadness': 'Sadness',
+        'anger': 'Anger',
+        'fear': 'Anxiety',
+        'surprise': 'Surprise',
+        'disgust': 'Frustration',
+        'love': 'Love'
+    }
+    
+    all_emotions = []
+    for emotion_data in emotion_scores:
+        emotion_label = emotion_data['label'].lower()
+        score = emotion_data['score']
+        
+        emotion_display = emotion_mapping.get(emotion_label, emotion_label.title())
+        
+        intensity = round(score * 10, 1)
+        
+        all_emotions.append({
+            'emotion': emotion_display,
+            'intensity': intensity
+        })
+    
+    all_emotions.sort(key=lambda x: x['intensity'], reverse=True)
+    return all_emotions[:4]  
+def get_sentiment_distribution(all_texts: list):
+    """
+    Simple sentiment distribution
+    """
+    sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0}
+
+    for text in all_texts:
+        score = sentiment_analyzer.polarity_scores(text)
+        if score["compound"] > 0.1:
+            sentiment_counts["positive"] += 1
+        elif score["compound"] < -0.1:
+            sentiment_counts["negative"] += 1
+        else:
+            sentiment_counts["neutral"] += 1
+
+    total = sum(sentiment_counts.values()) or 1
+    return {k: round((v / total) * 100, 1) for k, v in sentiment_counts.items()}
 
 def generate_llm_comment(prompt: str) -> str:
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
@@ -60,6 +197,8 @@ def generate_llm_comment(prompt: str) -> str:
     
     return comment
 
+
+# --- API Route ---
 @app.post("/analyze_mood")
 def analyze_mood(request: MoodLogRequest):
     logs = [log for log in request.logs if log.mood_score is not None and log.mood_label is not None]
@@ -77,102 +216,6 @@ def analyze_mood(request: MoodLogRequest):
         "dates": dates,
         "mood_scores": scores,
         "mood_distribution": mood_distribution
-    }
-
-# --- Journal API with Advanced Sentiment & Emotion Analysis ---
-@app.post("/analyze_journal")
-def analyze_journal(request: MoodLogRequest):
-    logs = [log for log in request.logs if log.journal_text]
-    if not logs:
-        return {"message": "No journal entries provided."}
-
-    all_texts = [log.journal_text for log in logs]
-
-    # --- Sentiment Analysis (positive/neutral/negative) ---
-    sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0}
-    for text in all_texts:
-        score = sentiment_analyzer.polarity_scores(text)
-        if score["compound"] > 0.05:
-            sentiment_counts["positive"] += 1
-        elif score["compound"] < -0.05:
-            sentiment_counts["negative"] += 1
-        else:
-            sentiment_counts["neutral"] += 1
-    total = sum(sentiment_counts.values())
-    sentiment_distribution = {k: round((v / total) * 100, 2) for k, v in sentiment_counts.items()}
-
-    # --- Advanced Emotion Analysis ---
-    emotion_summary = {}
-    for text in all_texts:
-        scores = emotion_analyzer(text)[0]  # list of emotions with scores
-        for item in scores:
-            label = item['label']
-            score = item['score']
-            emotion_summary[label] = max(score, emotion_summary.get(label, 0))  # keep max intensity
-
-    # --- Keyword / Theme Extraction (important ones only) ---
-    joined_text = " ".join(all_texts)
-    extracted = kw_model.extract_keywords(
-        joined_text,
-        keyphrase_ngram_range=(1, 2),
-        stop_words="english",
-        top_n=15,
-        use_maxsum=True,
-        nr_candidates=30
-    )
-
-    keywords = []
-    seen_tokens = set()
-    for word, score in extracted:
-        if score < 0.3:
-            continue
-        tokens = set(word.lower().split())
-        if not tokens & seen_tokens:
-            keywords.append(word)
-            seen_tokens.update(tokens)
-        if len(keywords) >= 7:
-            break
-
-    return {
-        "sentiment_distribution": sentiment_distribution,
-        "emotions": emotion_summary,
-        "topics": keywords
-    }
-
-@app.post("/generate_insights")
-def generate_insights(request: MoodLogRequest):
-    logs = [log for log in request.logs if log.journal_text]
-    if not logs:
-        return {"message": "No journal entries for insights."}
-
-    insights = []
-
-    # 1️⃣ Emotion / sentiment hints from journal
-    negative_keywords = ["stress", "anxiety", "pressure", "deadline"]
-    for i, log in enumerate(logs):
-        if any(nk in log.journal_text.lower() for nk in negative_keywords):
-            insights.append(f"Entry {i+1}: Your journal mentions stress-related topics. Consider relaxing activities.")
-
-    # 2️⃣ Sleep habit correlation
-    sleep_logs = [log.sleep_hours for log in logs if log.sleep_hours is not None]
-    if sleep_logs:
-        avg_sleep = sum(sleep_logs) / len(sleep_logs)
-        if avg_sleep < 6:
-            insights.append(f"Your average sleep is {avg_sleep:.1f} hours. More sleep may improve your mood.")
-
-    # 3️⃣ Exercise habit correlation
-    exercise_logs = [log.exercise_done for log in logs if log.exercise_done is not None]
-    if exercise_logs:
-        exercise_ratio = sum(exercise_logs) / len(exercise_logs)
-        if exercise_ratio < 0.5:
-            insights.append("Consider regular exercise; it often improves mood and reduces stress.")
-
-    # 4️⃣ Fallback if no major insights
-    if not insights:
-        insights.append("Keep up the journaling! Tracking your mood regularly helps improve self-awareness.")
-
-    return {
-        "insights": insights
     }
 
 
@@ -206,3 +249,38 @@ def generate_exercise_comment(entry: ExerciseEntry):
     """
     comment = generate_llm_comment(prompt)
     return {"exercise_comment": comment}
+
+   
+@app.post("/analyze_journal")
+def analyze_journal(request: MoodLogRequest):
+    logs = [log for log in request.logs if log.journal_text]
+    if not logs:
+        return {"message": "No journal entries provided."}
+
+    all_texts = [log.journal_text for log in logs]
+    joined_text = " ".join(all_texts)
+    top_emotions = get_top_emotions(joined_text)
+    sentiment_distribution = get_sentiment_distribution(all_texts)
+    topics = extract_meaningful_topics(joined_text, max_topics=7)
+    prompt = f"""
+You are a supportive mental health assistant. 💜  
+Here is a journal entry summary:  
+- Emotions: {top_emotions}  
+- Sentiment: {sentiment_distribution}  
+- Topics: {topics}  
+
+Write a short (1–2 sentence) empathetic and encouraging note.  
+✨ Keep it warm, validating, and human-like.  
+🌱 Use 2–3 emojis to add care and positivity.  
+❌ Do NOT give medical, therapeutic, or diagnostic advice.  
+✅ Focus only on appreciation, gentle encouragement, or validation.  
+"""
+
+    ai_comment = generate_llm_comment(prompt)
+
+    return {
+        "sentiment_distribution": sentiment_distribution,
+        "emotions": top_emotions,
+        "topics": topics,
+        "ai_comment": ai_comment
+    }
